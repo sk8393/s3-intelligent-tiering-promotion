@@ -1,0 +1,584 @@
+AWSTemplateFormatVersion : '2010-09-09'
+
+Parameters:
+  AverageObjectSizeThreshold:
+    Type: String
+    Default: '131072'
+    Description: "Set threshold of average object size.  Small average object size means impact of introducing S3 Intelligent-Tiering might be small.  Lifecycle rule to transition Standard storage class object to Intelligent-Tiering won't be applied to those S3 buckets."
+  ConfigRuleNameToDetectNonOptimizedS3Bucket:
+    Type: String
+    Default: 'rule-to-detect-s3-bucket-fit-intelligent-tiering'
+    Description: 'Name of AWS Config Custom Lambda Rule to detect S3 bucket which fits Intelligent-Tiering.'
+  GracePeriodBetweenNotificationAndLifecycleRuleApplication:
+    Type: String
+    Default: '7'
+    Description: 'Lifecycle rule will be applied after a certain grace period, after a notification is sent to S3 bucket owner.'
+  IntelligentTieringTransitionExemptionTagKey:
+    Type: String
+    Default: 'intelligent-tiering-transition-exemption'
+    Description: 'Tag key that you set to S3 bucket to exempt from the Lifecycle rule application.'
+  IntelligentTieringTransitionExemptionTagValue:
+    Type: String
+    Default: 'true'
+    Description: 'Tag value that you set to S3 bucket to exempt from the Lifecycle rule application.'
+  LifecycleRuleNameForIntelligentTiering:
+    Type: String
+    Default: 'lifecycle-rule-to-transition-to-intelligent-tiering'
+    Description: 'S3 Lifecycle rule to transition Standard storage class objects to Intelligent-Tiering.'
+  LifecycleRuleNameForMultipartUpload:
+    Type: String
+    Default: lifecycle-rule-to-delete-multipart-upload'
+    Description: 'S3 Lifecycle rule to delete incomplete multipart uploads.'
+  MaxWorkers:
+    Type: String
+    Default: '10'
+    AllowedValues : ['1', '2', '5', '10']
+    Description: 'The number of worker threads.  This can be modified afterward through MAX_WORKERS, environmental variables of Lambda function.'
+  MonitoringPeriod:
+    Type: String
+    Default: '90'
+    Description: "Lambda function looks back CloudWatch Metrics (default 90 days), whether any object has been deleted.  Lifecycle rule to transition Standard storage class object to Intelligent-Tiering won't be applied if BucketSizeBytes decreased."
+  NotificationSentToUserAtTagKey:
+    Type: String
+    Default: 'notification-sent-to-user-at'
+    Description: 'Timestamp of when notification was sent to S3 bucket owner.'
+  PromotionAppliedToS3BucketCreatedAfter:
+    Type: String
+    Default: '2023-07-01'
+    Description: 'To avoid any impact on daily operations, scope will be narrowed down.  Specifically, S3 buckets created after certain base date will be a target of S3 Intelligent-Tiering promotion.'
+  RuntimeLogLevel:
+    Type: String
+    Default: 'debug'
+    AllowedValues : ['debug', 'info']
+    Description: '"debug" records more log in CloudWatch Logs.  This can be modified afterward through RUNTIME_LOG_LEVEL, environmental variables of Lambda function.'
+
+Resources:
+  ResourceOfConfigRuleToDetectNonOptimizedS3Bucket:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ResourceOfLambdaPermission
+    Properties:
+      ConfigRuleName: !Ref ConfigRuleNameToDetectNonOptimizedS3Bucket
+      EvaluationModes:
+        - Mode: 'DETECTIVE'
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceDetails:
+        - EventSource: aws.config
+          MaximumExecutionFrequency: TwentyFour_Hours
+          MessageType: ScheduledNotification
+        SourceIdentifier: !GetAtt ResourceOfLambdaFunctionToDetectNonOptimizedS3Bucket.Arn
+
+  ResourceOfLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ResourceOfLambdaFunctionToDetectNonOptimizedS3Bucket.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+
+  ResourceOfIAMManagedPolicyToDeleteEvaluationResults:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "config:DeleteEvaluationResults"
+            Resource: "*"
+
+  ResourceOfIAMRoleToDetectNonOptimizedS3Bucket:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref ResourceOfIAMManagedPolicyToDeleteEvaluationResults
+
+  ResourceOfLambdaFunctionToDetectNonOptimizedS3Bucket:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          import datetime
+          import os
+          import threading
+          import time
+          
+          from concurrent.futures import as_completed
+          from concurrent.futures import ThreadPoolExecutor
+          from concurrent.futures import wait
+          
+          # AVERAGE_OBJECT_SIZE_THRESHOLD = 128 * 1024
+          # GRACE_PERIOD_BETWEEN_NOTIFICATION_AND_LIFECYCLE_RULE_APPLICATION = 7
+          # INTELLIGENT_TIERING_TRANSITION_EXEMPTION_TAG_KEY = 'intelligent-tiering-transition-exemption'
+          # INTELLIGENT_TIERING_TRANSITION_EXEMPTION_TAG_VALUE = 'true'
+          # LIFECYCLE_RULE_NAME_FOR_INTELLIGENT_TIERING = 'lifecycle-rule-to-transition-to-intelligent-tiering'
+          # LIFECYCLE_RULE_NAME_FOR_MULTIPART_UPLOAD = 'lifecycle-rule-to-delete-multipart-upload'
+          # MAX_WORKERS = 2
+          # MONITORING_PERIOD = 90
+          # NOTIFICATION_SENT_TO_USER_AT_TAG_KEY = 'notification-sent-to-user-at'
+          # PROMOTION_APPLIED_TO_S3_BUCKET_CREATED_AFTER = datetime.datetime.strptime('2023-07-01', '%Y-%m-%d').replace(tzinfo=datetime.timezone(offset=datetime.timedelta()))
+          # RUNTIME_LOG_LEVEL = 'debug'
+          
+          AVERAGE_OBJECT_SIZE_THRESHOLD = int(os.environ['AVERAGE_OBJECT_SIZE_THRESHOLD'])
+          GRACE_PERIOD_BETWEEN_NOTIFICATION_AND_LIFECYCLE_RULE_APPLICATION = int(os.environ['GRACE_PERIOD_BETWEEN_NOTIFICATION_AND_LIFECYCLE_RULE_APPLICATION'])
+          INTELLIGENT_TIERING_TRANSITION_EXEMPTION_TAG_KEY = os.environ['INTELLIGENT_TIERING_TRANSITION_EXEMPTION_TAG_KEY']
+          INTELLIGENT_TIERING_TRANSITION_EXEMPTION_TAG_VALUE = os.environ['INTELLIGENT_TIERING_TRANSITION_EXEMPTION_TAG_VALUE']
+          LIFECYCLE_RULE_NAME_FOR_INTELLIGENT_TIERING = os.environ['LIFECYCLE_RULE_NAME_FOR_INTELLIGENT_TIERING']
+          LIFECYCLE_RULE_NAME_FOR_MULTIPART_UPLOAD = os.environ['LIFECYCLE_RULE_NAME_FOR_MULTIPART_UPLOAD']
+          MAX_WORKERS = int(os.environ['MAX_WORKERS'])
+          MONITORING_PERIOD = int(os.environ['MONITORING_PERIOD'])
+          NOTIFICATION_SENT_TO_USER_AT_TAG_KEY = os.environ['NOTIFICATION_SENT_TO_USER_AT_TAG_KEY']
+          PROMOTION_APPLIED_TO_S3_BUCKET_CREATED_AFTER = datetime.datetime.strptime(os.environ['PROMOTION_APPLIED_TO_S3_BUCKET_CREATED_AFTER'], '%Y-%m-%d').replace(tzinfo=datetime.timezone(offset=datetime.timedelta()))
+          RUNTIME_LOG_LEVEL = os.environ['RUNTIME_LOG_LEVEL']
+          
+          def convert_log_level_to_number(_arg_log_level):
+              if _arg_log_level == 'debug':
+                  log_level_number = 2
+              elif _arg_log_level == 'info':
+                  log_level_number = 1
+              else:
+                  print("Either debug or info has to be set.")
+                  exit(1)
+              return log_level_number
+          
+          def show_message(_arg_message, _arg_log_level='info'):
+              log_level_number         = convert_log_level_to_number(_arg_log_level)
+              runtime_log_level_number = convert_log_level_to_number(RUNTIME_LOG_LEVEL)
+              if log_level_number > runtime_log_level_number:
+                  # For example, RUNTIME_LOG_LEVEL=info and _arg_log_level=debug
+                  # That means the program was launched as not so much log is needed.
+                  # In that case, message of show_message(_arg_log_level='debug') won't be recorded.
+                  return
+              try:
+                  now = datetime.datetime.now()
+                  thread_id = threading.get_native_id()
+                  message = str(_arg_message).strip()
+                  formatted_message = "%s%s%s" % (
+                      ("%s: " % now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]),
+                      "[%s] " % thread_id,
+                      message
+                  )
+                  print(formatted_message)
+              except Exception as e:
+                  print("type(e) = ".format(type(e)))
+                  print("e = {}".format(e))
+          
+          def get_s3_bucket_name_list():
+              client = boto3.client('s3')
+              response = client.list_buckets()
+              bucket_list = response.get('Buckets', [])
+              bucket_name_list = list()
+              for _i in bucket_list:
+                  bucket_name_list.append(_i['Name'])
+              return bucket_name_list
+          
+          def get_s3_bucket_creation_date(_arg_s3_bucket_name):
+              client = boto3.resource('s3')
+              creation_date = client.Bucket(_arg_s3_bucket_name).creation_date
+              return creation_date
+          
+          def check_is_lifecycle_rule_set(_arg_s3_bucket_name):
+              is_lifecycle_rule_set = True
+              client = boto3.client('s3')
+              try:
+                  response = client.get_bucket_lifecycle(Bucket=_arg_s3_bucket_name)
+                  rule_list = response.get('Rules', [])
+                  show_message("rule_list = {}".format(rule_list), _arg_log_level='debug')
+              except botocore.exceptions.ClientError as e:
+                  is_lifecycle_rule_set = False
+              return is_lifecycle_rule_set
+          
+          def get_tag_value(_arg_s3_bucket_name, _arg_tag_key):
+              tag_value = None
+              client = boto3.client('s3')
+              try:
+                  response = client.get_bucket_tagging(Bucket=_arg_s3_bucket_name)
+                  tag_set_list = response.get('TagSet', [])
+                  for _i in tag_set_list:
+                      key = _i['Key']
+                      value = _i['Value']
+                      if key == _arg_tag_key:
+                          tag_value = value
+                      else:
+                          pass
+              except botocore.exceptions.ClientError as e:
+                  show_message("type(e) = {}".format(type(e)), _arg_log_level='debug')
+                  show_message("e = {}".format(e), _arg_log_level='debug')
+              return tag_value
+          
+          def set_tag_value(_arg_s3_bucket_name, _arg_tag_key, _arg_tag_value):
+              client = boto3.client('s3')
+              try:
+                  old_tags = {}
+                  old = client.get_bucket_tagging(Bucket=_arg_s3_bucket_name)
+                  old_tags = {_i['Key']: _i['Value'] for _i in old['TagSet']}
+                  new_tags = {_arg_tag_key: _arg_tag_value}
+                  new_tags = {**old_tags, **new_tags}
+                  show_message("new_tags = {}".format(new_tags), _arg_log_level='debug')
+                  response = client.put_bucket_tagging(
+                      Bucket=_arg_s3_bucket_name,
+                      Tagging={
+                          'TagSet': [{'Key': str(_k), 'Value': str(_v)} for _k, _v in new_tags.items()]
+                      }
+                  )
+                  show_message("response['ResponseMetadata']['HTTPStatusCode'] = {}".format(response['ResponseMetadata']['HTTPStatusCode']), _arg_log_level='debug')
+              except Exception as e:
+                  show_message('bca983f5')
+                  show_message("type(e) = {}".format(type(e)))
+                  show_message("e = {}".format(e))
+              return
+          
+          def put_config_evaluation(_arg_evaluation_list, _arg_result_token):
+              client = boto3.client("config")
+              response = client.put_evaluations(
+                  Evaluations = _arg_evaluation_list,
+                  ResultToken = _arg_result_token
+              )
+              show_message("response = {}".format(response), _arg_log_level='debug')
+          
+          def put_s3_bucket_lifecycle_rule(_arg_s3_bucket_name):
+              client = boto3.client('s3')
+          
+              lifecycle_rule_for_intelligent_tiering = {
+                  'Filter': {
+                      'ObjectSizeGreaterThan': 131072
+                  },
+                  'ID': LIFECYCLE_RULE_NAME_FOR_INTELLIGENT_TIERING,
+                  'NoncurrentVersionTransitions': [
+                      {
+                          'NoncurrentDays': 0,
+                          'StorageClass': 'INTELLIGENT_TIERING'
+                      }
+                  ],
+                  'Status': 'Enabled',
+                  'Transitions': [
+                      {
+                          'Days': 0,
+                          'StorageClass': 'INTELLIGENT_TIERING'
+                      }
+                  ]
+              }
+          
+              lifecycle_rule_for_multipart_upload = {
+                  'Filter': {
+                      'Prefix': ''
+                  },
+                  'AbortIncompleteMultipartUpload': {
+                      'DaysAfterInitiation': 7
+                  },
+                  'ID': LIFECYCLE_RULE_NAME_FOR_MULTIPART_UPLOAD,
+                  'Status': 'Enabled'
+              }
+          
+              lifecycle_configuration = {
+                  'Rules': [lifecycle_rule_for_intelligent_tiering, lifecycle_rule_for_multipart_upload]
+              }
+          
+              client.put_bucket_lifecycle_configuration(
+                  Bucket=_arg_s3_bucket_name,
+                  LifecycleConfiguration=lifecycle_configuration
+              )
+          
+          def get_s3_bucket_region(_arg_s3_bucket_name):
+              client = boto3.client('s3')
+              response = client.head_bucket(Bucket=_arg_s3_bucket_name)
+              bucket_region = response['ResponseMetadata']['HTTPHeaders']['x-amz-bucket-region']
+              return bucket_region
+          
+          def check_is_all_object_standard(_arg_s3_bucket_name):
+              is_all_object_standard = False
+              s3_bucket_region = get_s3_bucket_region(_arg_s3_bucket_name)
+              client = boto3.setup_default_session(region_name=s3_bucket_region)
+              client = boto3.client('cloudwatch')
+              response = client.list_metrics(
+                  Dimensions=[{'Name':'BucketName','Value':_arg_s3_bucket_name}],
+                  MetricName = 'BucketSizeBytes',
+                  Namespace = 'AWS/S3'
+              )
+              metric_list = response.get('Metrics', [])
+              # 'Metrics' includes elements for each storage class.
+              # e.g. metric_list = [
+              #   {
+              #     'Namespace': 'AWS/S3',
+              #     'MetricName': 'BucketSizeBytes',
+              #     'Dimensions': [
+              #       {'Name': 'BucketName', 'Value': 'intelligent-tiering-object-size-bigger-128'},
+              #       {'Name': 'StorageType', 'Value': 'StandardStorage'}
+              #     ]
+              #   }
+              # ]
+              show_message("metric_list = {}".format(metric_list), _arg_log_level='debug')
+              if len(metric_list) == 1:
+                  value_list = list()
+                  for _i in metric_list[0]['Dimensions']:
+                      value_list.append(_i['Value'])
+                  # e.g. value_list = ['intelligent-tiering-object-size-bigger-128', 'StandardStorage']
+                  if 'StandardStorage' in value_list:
+                      is_all_object_standard = True
+                  else:
+                      pass
+              else:
+                  pass
+              return is_all_object_standard
+          
+          # If 1/ any object has been not deleted, AND 2/ object size is bigger than threshold, then True.
+          # Otherwise, if 1/ any object has been deleted, OR 2/ object size is smaller than threshold, then False.
+          def check_whether_object_is_not_deleted_and_size_is_bigger_than_threshold(_arg_s3_bucket_name):
+              whether_object_is_not_deleted_and_size_is_bigger_than_threshold = False
+              try:
+                  s3_bucket_region = get_s3_bucket_region(_arg_s3_bucket_name)
+                  client = boto3.setup_default_session(region_name=s3_bucket_region)
+                  client = boto3.client('cloudwatch')
+                  now = datetime.datetime.now()
+                  response = client.get_metric_statistics(Namespace='AWS/S3',
+                                                      MetricName='BucketSizeBytes',
+                                                      Dimensions=[
+                                                          {'Name': 'BucketName', 'Value': _arg_s3_bucket_name},
+                                                          {'Name': 'StorageType', 'Value': 'StandardStorage'}
+                                                      ],
+                                                      Statistics=['Average'],
+                                                      Period=86400,
+                                                      StartTime=(now-datetime.timedelta(days=MONITORING_PERIOD)).isoformat(),
+                                                      EndTime=now.isoformat()
+                                                      )
+                  data_point_list = response['Datapoints']
+                  # If there is no record of CloudWatch Metrics, that means the S3 bucket is empty or first object stored recently.
+                  # To judge whether S3 Intelligent-Tiering is a good fit, we need data of past usage pattern.
+                  # To put on a safer side, let's cosider empty S3 bucket as 'ineligible'.
+                  if len(data_point_list) == 0:
+                      whether_object_is_not_deleted_and_size_is_bigger_than_threshold = False
+                      return whether_object_is_not_deleted_and_size_is_bigger_than_threshold
+                  sorted_data_point_list = sorted(data_point_list, key=lambda x: x['Timestamp'])
+          
+                  last_iteration_bucket_size_bytes = 0
+                  for _i_sorted_data_point in sorted_data_point_list:
+                      bucket_size_bytes = _i_sorted_data_point['Average']
+                      timestamp = _i_sorted_data_point['Timestamp']
+                      show_message("bucket_size_bytes - last_iteration_bucket_size_bytes = {} - {} = {} at {}".format(bucket_size_bytes, last_iteration_bucket_size_bytes, bucket_size_bytes - last_iteration_bucket_size_bytes, timestamp), _arg_log_level='debug')
+                      if (bucket_size_bytes - last_iteration_bucket_size_bytes) >= 0:
+                          last_iteration_bucket_size_bytes = bucket_size_bytes
+                      else:
+                          # When bucket_size_bytes decreased, that means objects were deleted or moved to different storage class.
+                          # In such case, the bucket is COMPLIANT and no need for further examination.
+                          whether_object_is_not_deleted_and_size_is_bigger_than_threshold = False
+                          return whether_object_is_not_deleted_and_size_is_bigger_than_threshold
+          
+                  lastest_bucket_size_bytes = sorted_data_point_list[-1]['Average']
+                  show_message("lastest_bucket_size_bytes = {}".format(lastest_bucket_size_bytes), _arg_log_level='debug')
+                  response = client.get_metric_statistics(Namespace='AWS/S3',
+                                                      MetricName='NumberOfObjects',
+                                                      Dimensions=[
+                                                          {'Name': 'BucketName', 'Value': _arg_s3_bucket_name},
+                                                          {'Name': 'StorageType', 'Value': 'AllStorageTypes'}
+                                                      ],
+                                                      Statistics=['Average'],
+                                                      Period=86400,
+                                                      StartTime=(now-datetime.timedelta(days=MONITORING_PERIOD)).isoformat(),
+                                                      EndTime=now.isoformat()
+                                                      )
+                  data_point_list = response['Datapoints']
+                  sorted_data_point_list = sorted(data_point_list, key=lambda x: x['Timestamp'])
+                  lastest_number_of_objects = sorted_data_point_list[-1]['Average']
+                  show_message("lastest_number_of_objects = {}".format(lastest_number_of_objects), _arg_log_level='debug')
+                  average_object_size = lastest_bucket_size_bytes/lastest_number_of_objects
+                  show_message("average_object_size = lastest_bucket_size_bytes/lastest_number_of_objects = {}/{} = {}".format(lastest_bucket_size_bytes, lastest_number_of_objects, average_object_size), _arg_log_level='debug')
+                  if average_object_size >= AVERAGE_OBJECT_SIZE_THRESHOLD:
+                      # Object was not deleted, and average size was bigger than threshold, that means we need for further examination.
+                      whether_object_is_not_deleted_and_size_is_bigger_than_threshold = True
+                  else:
+                      whether_object_is_not_deleted_and_size_is_bigger_than_threshold = False
+              except Exception as e:
+                  show_message("type(e) = {}".format(type(e)), _arg_log_level='debug')
+                  show_message("e = {}".format(e), _arg_log_level='debug')
+              return whether_object_is_not_deleted_and_size_is_bigger_than_threshold
+          
+          def notify_s3_bucket_owner(_arg_s3_bucket_name):
+              pass
+          
+          def evaluate_s3_intelligent_tiering_appropriateness(_arg_s3_bucket_name):
+              show_message('938ac4d4', _arg_log_level='debug')
+              evaluation = {
+                  'ComplianceResourceType': 'AWS::S3::Bucket',
+                  'ComplianceResourceId': _arg_s3_bucket_name,
+                  'ComplianceType': 'COMPLIANT',
+                  'OrderingTimestamp': '1970-01-01T00:00:00.0Z'
+              }
+              try:
+                  show_message("_arg_s3_bucket_name = {}".format(_arg_s3_bucket_name))
+          
+                  # Evaluation: "Intelligent Tiering Transition Exemption" tag is set to S3 bucket.
+                  tag_value = get_tag_value(_arg_s3_bucket_name, INTELLIGENT_TIERING_TRANSITION_EXEMPTION_TAG_KEY)
+                  show_message("tag_value = {}".format(tag_value), _arg_log_level='debug')
+                  if tag_value == INTELLIGENT_TIERING_TRANSITION_EXEMPTION_TAG_VALUE:
+                      # "Intelligent Tiering Transition Exemption" tag was set to S3 bucket, finish evaluation.
+                      show_message('a1c8d542', _arg_log_level='debug')
+                      evaluation['ComplianceType'] = 'NOT_APPLICABLE'
+                      return evaluation
+                  else:
+                      # "Intelligent Tiering Transition Exemption" tag was not set to S3 bucket, go next.
+                      show_message('26dffaad', _arg_log_level='debug')
+          
+                  # Evaluation: "Notification Sent To User At" tag is set to S3 bucket.
+                  show_message('7764d2d4', _arg_log_level='debug')
+                  now_at = int(time.time())
+                  show_message("now_at = {}".format(now_at), _arg_log_level='debug')
+                  tag_value = get_tag_value(_arg_s3_bucket_name, NOTIFICATION_SENT_TO_USER_AT_TAG_KEY)
+                  show_message("tag_value = {}".format(tag_value), _arg_log_level='debug')
+                  if tag_value:
+                      # "Notification Sent To User At" tag was set to S3 bucket.
+                      try:
+                          show_message('0d212228', _arg_log_level='debug')
+                          notification_sent_to_user_at = int(tag_value)
+                          if now_at - notification_sent_to_user_at > GRACE_PERIOD_BETWEEN_NOTIFICATION_AND_LIFECYCLE_RULE_APPLICATION * 24 * 60 * 60:
+                              # "Notification Sent To User At" tag was set to S3 bucket, and grace period has passed.
+                              show_message('de2ed868', _arg_log_level='debug')
+                              put_s3_bucket_lifecycle_rule(_arg_s3_bucket_name)
+                              evaluation['ComplianceType'] = 'COMPLIANT'
+                              return evaluation
+                          else:
+                              # "Notification Sent To User At" tag was set to S3 bucket, but grace period has not passed.
+                              show_message('1b5c2371', _arg_log_level='debug')
+                              evaluation['ComplianceType'] = 'NON_COMPLIANT'
+                              return evaluation
+                      except ValueError as e:
+                          # "Notification Sent To User At" tag was set to S3 bucket, but tag value was not integer.
+                          show_message('5d6754a5', _arg_log_level='debug')
+                          show_message("type(e) = {}".format(type(e)), _arg_log_level='debug')
+                          show_message("e = {}".format(e), _arg_log_level='debug')
+                          # Need notification here.
+                          set_tag_value(_arg_s3_bucket_name, NOTIFICATION_SENT_TO_USER_AT_TAG_KEY, str(now_at))
+                  else:
+                      # "Notification Sent To User At" tag was set to S3 bucket, go next.
+                      show_message('edb7bf8e', _arg_log_level='debug')
+          
+                  # Evaluation: The S3 bucket was created before July 1st, 2023 (base date).
+                  s3_bucket_creation_date = get_s3_bucket_creation_date(_arg_s3_bucket_name)
+                  show_message("s3_bucket_creation_date = {}".format(s3_bucket_creation_date))
+                  show_message("PROMOTION_APPLIED_TO_S3_BUCKET_CREATED_AFTER = {}".format(PROMOTION_APPLIED_TO_S3_BUCKET_CREATED_AFTER))
+                  if s3_bucket_creation_date > PROMOTION_APPLIED_TO_S3_BUCKET_CREATED_AFTER:
+                      # The S3 bucket was created after July 1st, 2023, go next.
+                      show_message('fa54f3d4', _arg_log_level='debug')
+                  else:
+                      # The S3 bucket was created before July 1st, 2023.
+                      show_message('1916e065', _arg_log_level='debug')
+                      evaluation['ComplianceType'] = 'NOT_APPLICABLE'
+                      return evaluation
+          
+                  # Evaluation: Is any Lifecycle rule already applied to the S3 bucket
+                  is_lifecycle_rule_set = check_is_lifecycle_rule_set(_arg_s3_bucket_name)
+                  show_message("is_lifecycle_rule_set = {}".format(is_lifecycle_rule_set), _arg_log_level='debug')
+                  if is_lifecycle_rule_set is True:
+                      show_message('c24ebed0', _arg_log_level='debug')
+                      evaluation['ComplianceType'] = 'COMPLIANT'
+                      return evaluation
+                  else:
+                      show_message('318f15fd', _arg_log_level='debug')
+          
+                  # Evaluation: Are only Standard objects stored?
+                  is_all_object_standard = check_is_all_object_standard(_arg_s3_bucket_name)
+                  show_message("is_all_object_standard = {}".format(is_all_object_standard), _arg_log_level='debug')
+                  if is_all_object_standard:
+                      # Only Standard objects are stored, go next.
+                      show_message('9edc34bc', _arg_log_level='debug')
+                  else:
+                      # Multiple storage class objects are stored.
+                      show_message('6f8c3013', _arg_log_level='debug')
+                      evaluation['ComplianceType'] = 'COMPLIANT'
+                      return evaluation
+          
+                  # Evaluation: Have objects been deleted in the last 90 days?
+                  # Evaluation: Is average object size smaller than 128 Kilobytes?
+                  whether_object_is_not_deleted_and_size_is_bigger_than_threshold = check_whether_object_is_not_deleted_and_size_is_bigger_than_threshold(_arg_s3_bucket_name)
+                  show_message("whether_object_is_not_deleted_and_size_is_bigger_than_threshold = {}".format(whether_object_is_not_deleted_and_size_is_bigger_than_threshold), _arg_log_level='debug')
+                  if whether_object_is_not_deleted_and_size_is_bigger_than_threshold:
+                      # 1/ Any object has been not deleted, AND 2/ object size is bigger than threshold.
+                      show_message('1af10728', _arg_log_level='debug')
+                      evaluation['ComplianceType'] = 'NON_COMPLIANT'
+                  else:
+                      # 1/ Any object has been deleted, OR 2/ object size is smaller than threshold.
+                      show_message('d8a6c2f0', _arg_log_level='debug')
+                      evaluation['ComplianceType'] = 'COMPLIANT'
+                      return evaluation
+          
+                  show_message('e970de40', _arg_log_level='debug')
+                  # Notify the user (S3 bucket owner) that Lifecycle rule will be applied after a certain period of time
+                  notify_s3_bucket_owner(_arg_s3_bucket_name)
+                  show_message('8d65ea24', _arg_log_level='debug')
+                  # Set "Notification Sent To User At" tag to S3 bucket with timestamp
+                  set_tag_value(_arg_s3_bucket_name, NOTIFICATION_SENT_TO_USER_AT_TAG_KEY, str(now_at))
+                  show_message('5aaf8025', _arg_log_level='debug')
+              except Exception as e:
+                  show_message('40256242')
+                  show_message("type(e) = ".format(type(e)))
+                  show_message("e = {}".format(e))
+              show_message('f856cd08', _arg_log_level='debug')
+              return evaluation
+          
+          # if __name__ == '__main__':
+          def lambda_handler(event, context):
+              show_message("event = {}".format(event), _arg_log_level='debug')
+          
+              result_token = "No token found."
+              if "resultToken" in event:
+                  result_token = event["resultToken"]
+              show_message("result_token = {}".format(result_token), _arg_log_level='debug')
+          
+              s3_bucket_name_list = get_s3_bucket_name_list()
+              # Override list of S3 buckets during test.
+              # s3_bucket_name_list = ['example-bucket-01', 'example-bucket-02']
+              for _i_s3_bucket_name in s3_bucket_name_list:
+                  show_message("_i_s3_bucket_name = {}".format(_i_s3_bucket_name))
+          
+              with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                  futures = [executor.submit(evaluate_s3_intelligent_tiering_appropriateness, x) for x in s3_bucket_name_list]
+          
+                  show_message("just after submit", _arg_log_level='debug')
+          
+                  (done, notdone) = wait(futures)
+          
+                  show_message("after wait and before future", _arg_log_level='debug')
+          
+                  evaluation_list = list()
+                  for _i_future in futures:
+                  # for _i_future in as_completed(futures):
+                      evaluation = _i_future.result()
+                      show_message("evaluation = {}".format(evaluation), _arg_log_level='debug')
+                      evaluation_list.append(evaluation)
+                  show_message("evaluation_list = {}".format(evaluation_list))
+          
+                  show_message("after future", _arg_log_level='debug')
+          
+                  put_config_evaluation(evaluation_list, result_token)
+      Environment:
+        Variables:
+          AVERAGE_OBJECT_SIZE_THRESHOLD: !Ref AverageObjectSizeThreshold
+          GRACE_PERIOD_BETWEEN_NOTIFICATION_AND_LIFECYCLE_RULE_APPLICATION: !Ref GracePeriodBetweenNotificationAndLifecycleRuleApplication
+          INTELLIGENT_TIERING_TRANSITION_EXEMPTION_TAG_KEY: !Ref IntelligentTieringTransitionExemptionTagKey
+          INTELLIGENT_TIERING_TRANSITION_EXEMPTION_TAG_VALUE: !Ref IntelligentTieringTransitionExemptionTagValue
+          LIFECYCLE_RULE_NAME_FOR_INTELLIGENT_TIERING: !Ref LifecycleRuleNameForIntelligentTiering
+          LIFECYCLE_RULE_NAME_FOR_MULTIPART_UPLOAD: !Ref LifecycleRuleNameForMultipartUpload
+          MAX_WORKERS: !Ref MaxWorkers
+          MONITORING_PERIOD: !Ref MonitoringPeriod
+          NOTIFICATION_SENT_TO_USER_AT_TAG_KEY: !Ref NotificationSentToUserAtTagKey
+          PROMOTION_APPLIED_TO_S3_BUCKET_CREATED_AFTER: !Ref PromotionAppliedToS3BucketCreatedAfter
+          RUNTIME_LOG_LEVEL: !Ref RuntimeLogLevel
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Role: !GetAtt ResourceOfIAMRoleToDetectNonOptimizedS3Bucket.Arn
+      Runtime: python3.11
+      Timeout: 900
